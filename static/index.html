@@ -118,6 +118,17 @@
   .welcome { position: relative; padding: 32px 0 24px; }
   body.inicio .welcome h2 { font-size: clamp(26px, 4.6vw, 40px); line-height: 1.15; margin-bottom: 14px; letter-spacing: -.01em; }
   body.inicio .welcome p { font-size: 16px; max-width: 600px; margin-bottom: 26px; }
+  .saludo {
+    font-size: clamp(40px, 6vw, 56px); line-height: 1; margin-bottom: 10px;
+    display: inline-block; transform-origin: 70% 70%; animation: saludar 2.4s ease-in-out 0.3s 2;
+  }
+  @keyframes saludar {
+    0%, 60%, 100% { transform: rotate(0); }
+    10%, 30% { transform: rotate(16deg); }
+    20%, 40% { transform: rotate(-8deg); }
+    50% { transform: rotate(10deg); }
+  }
+  @media (prefers-reduced-motion: reduce) { .saludo { animation: none; } }
   .hero-slot { max-width: 620px; margin: 0 auto 10px; }
   .hero-slot form textarea {
     border-radius: 999px; padding: 13px 20px; min-height: 52px; max-height: 96px;
@@ -176,6 +187,7 @@
       <span class="floaty f4" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><rect x="7" y="9" width="18" height="16" rx="6" fill="#3e89fb"/><rect x="10" y="13" width="12" height="7" rx="3.5" fill="#0b1b33"/><circle cx="13.5" cy="16.5" r="1.4" fill="#3cf9c9"/><circle cx="18.5" cy="16.5" r="1.4" fill="#3cf9c9"/><circle cx="25" cy="8" r="3" fill="#ff5d73"/></svg></span>
       <span class="floaty f5" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><rect x="5" y="7" width="22" height="16" rx="4" fill="#3cf9c9"/><path d="M11 23l-2 4 6-4" fill="#3cf9c9"/><rect x="9" y="12" width="9" height="2" rx="1" fill="#0b1b33"/><rect x="9" y="16" width="14" height="2" rx="1" fill="#0b1b33" opacity=".55"/></svg></span>
 
+      <div class="saludo" aria-hidden="true">👋</div>
       <h2>¡Hola! Soy Luna</h2>
       <p>Tu asistente de soporte de Kommo CRM. Yo te puedo ayudar con preguntas frecuentes del uso del sistema, con dudas de problemas técnicos y cualquier cosa para que domines el uso de Kommo CRM. Empieza por hacerme una pregunta en la casilla de chat.</p>
       <div class="hero-slot" id="heroSlot"></div>
