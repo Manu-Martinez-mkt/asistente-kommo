@@ -1,3 +1,3 @@
-anthropic==2.10.0
+google-genai==2.34.0
 fastapi==0.128.8
 uvicorn==0.39.0

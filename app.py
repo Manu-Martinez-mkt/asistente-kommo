@@ -2,12 +2,13 @@
 
 Sirve la página del chat (static/index.html) y un endpoint /api/chat que
 responde en streaming (Server-Sent Events) usando la API de Claude, con la
-base de conocimiento en el system prompt (cacheada).
+base de conocimiento en las instrucciones del sistema. Usa la API de Gemini
+(Google); Gemini guarda en caché automáticamente el prefijo repetido.
 
 Variables de entorno:
-  ANTHROPIC_API_KEY        clave de la API de Anthropic (obligatoria salvo MOCK_MODE=1)
-  MODEL                    modelo (por defecto claude-opus-5-5)
-  EFFORT                   low | medium | high (por defecto medium)
+  GEMINI_API_KEY           clave de la API de Gemini (obligatoria salvo MOCK_MODE=1)
+  MODEL                    modelo (por defecto gemini-3.8-flash)
+  EFFORT                   nivel de razonamiento: low | medium | high (por defecto medium)
   CONTACTO_ESCALAMIENTO    a quién derivar (texto que va en el prompt)
   RATE_LIMIT_PER_10MIN     mensajes por IP cada 10 minutos (por defecto 30)
   ALLOWED_ORIGINS          dominios que pueden incrustar/llamar el chat, separados por coma
@@ -23,7 +24,8 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import List, Literal
 
-import anthropic
+from google import genai
+from google.genai import errors, types
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -31,7 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).parent
-MODEL = os.getenv("MODEL", "claude-opus-5-5")
+MODEL = os.getenv("MODEL", "gemini-3.8-flash")
 EFFORT = os.getenv("EFFORT", "medium")
 MOCK_MODE = os.getenv("MOCK_MODE") == "1"
 CONTACTO = os.getenv(
@@ -54,14 +56,14 @@ instrucciones = (BASE_DIR / "prompt.md").read_text(encoding="utf-8").replace(
     "{{CONTACTO_ESCALAMIENTO}}", CONTACTO
 )
 base_conocimiento = (BASE_DIR / "base-conocimiento-kommo.md").read_text(encoding="utf-8")
-SYSTEM = [
-    {"type": "text", "text": instrucciones},
-    {
-        "type": "text",
-        "text": f"<base_de_conocimiento>\n{base_conocimiento}\n</base_de_conocimiento>",
-        "cache_control": {"type": "ephemeral", "ttl": "1h"},
-    },
-]
+SYSTEM = (
+    f"{instrucciones}\n\n<base_de_conocimiento>\n{base_conocimiento}\n</base_de_conocimiento>"
+)
+CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM,
+    max_output_tokens=8000,
+    thinking_config=types.ThinkingConfig(thinking_level=EFFORT),
+)
 
 MENSAJE_RECHAZO = (
     "No puedo ayudarte con eso. Si tu duda es sobre Kommo, cuéntamela de otra forma "
@@ -72,7 +74,7 @@ MENSAJE_ERROR = (
     "fallando, escríbele a tu asesor de " + CONTACTO + "."
 )
 
-client = None if MOCK_MODE else anthropic.AsyncAnthropic()
+client = None if MOCK_MODE else genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 app = FastAPI(title="Asistente Kommo")
 if ALLOWED_ORIGINS:
@@ -129,6 +131,17 @@ def _preparar_historial(msgs: List[Mensaje]) -> list:
     return [{"role": m.role, "content": m.content} for m in msgs]
 
 
+def _a_gemini(mensajes: list) -> list:
+    # Gemini llama "model" al rol del asistente.
+    return [
+        types.Content(
+            role="model" if m["role"] == "assistant" else "user",
+            parts=[types.Part(text=m["content"])],
+        )
+        for m in mensajes
+    ]
+
+
 async def _stream_mock(pregunta: str):
     texto = (
         "**Modo de prueba** (sin conexión a la IA).\n\n"
@@ -143,48 +156,53 @@ async def _stream_mock(pregunta: str):
     yield _sse({"done": True})
 
 
-async def _stream_claude(mensajes: list, ip: str):
-    inicio = time.time()
-    try:
-        async with client.beta.messages.stream(
-            model=MODEL,
-            max_tokens=16000,
-            system=SYSTEM,
-            messages=mensajes,
-            output_config={"effort": EFFORT},
-            # Si el modelo rechaza la petición por política, la API la reintenta
-            # en otro modelo dentro de la misma llamada.
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        ) as stream:
-            async for texto in stream.text_stream:
-                yield _sse({"t": texto})
-            final = await stream.get_final_message()
+BLOQUEOS = {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION"}
 
-        if final.stop_reason == "refusal":
-            yield _sse({"t": MENSAJE_RECHAZO})
-        u = final.usage
+
+async def _stream_gemini(mensajes: list, ip: str):
+    inicio = time.time()
+    hubo_texto = False
+    motivo = None
+    uso = None
+    try:
+        stream = await client.aio.models.generate_content_stream(
+            model=MODEL, contents=_a_gemini(mensajes), config=CONFIG
+        )
+        async for chunk in stream:
+            if chunk.usage_metadata:
+                uso = chunk.usage_metadata
+            if chunk.candidates and chunk.candidates[0].finish_reason:
+                motivo = chunk.candidates[0].finish_reason.name
+            if chunk.prompt_feedback and chunk.prompt_feedback.block_reason:
+                motivo = "BLOQUEO_PREGUNTA"
+            texto = chunk.text if chunk.candidates else None
+            if texto:
+                hubo_texto = True
+                yield _sse({"t": texto})
+
+        if not hubo_texto:
+            yield _sse({"t": MENSAJE_RECHAZO if (motivo in BLOQUEOS or motivo == "BLOQUEO_PREGUNTA") else MENSAJE_ERROR})
         log.info(json.dumps({
             "evento": "respuesta",
             "ip": ip,
             "pregunta": mensajes[-1]["content"][:500],
-            "stop_reason": final.stop_reason,
+            "fin": motivo,
             "segundos": round(time.time() - inicio, 1),
-            "tokens_entrada": u.input_tokens,
-            "tokens_cache_leidos": u.cache_read_input_tokens,
-            "tokens_cache_escritos": u.cache_creation_input_tokens,
-            "tokens_salida": u.output_tokens,
+            "tokens_entrada": getattr(uso, "prompt_token_count", None),
+            "tokens_cache": getattr(uso, "cached_content_token_count", None),
+            "tokens_razonamiento": getattr(uso, "thoughts_token_count", None),
+            "tokens_salida": getattr(uso, "candidates_token_count", None),
         }, ensure_ascii=False))
         yield _sse({"done": True})
 
-    except anthropic.RateLimitError:
-        log.warning(json.dumps({"evento": "rate_limit_api", "ip": ip}))
-        yield _sse({"error": "Hay mucha demanda en este momento. Intenta de nuevo en un minuto."})
-    except anthropic.APIStatusError as e:
-        log.error(json.dumps({"evento": "error_api", "status": e.status_code, "detalle": str(e.message)[:300]}))
-        yield _sse({"error": MENSAJE_ERROR})
-    except anthropic.APIConnectionError:
-        log.error(json.dumps({"evento": "error_conexion"}))
+    except errors.APIError as e:
+        log.error(json.dumps({"evento": "error_api", "status": e.code, "detalle": str(e.message)[:300]}))
+        if e.code == 429:
+            yield _sse({"error": "Hay mucha demanda en este momento. Intenta de nuevo en un minuto."})
+        else:
+            yield _sse({"error": MENSAJE_ERROR})
+    except Exception as e:  # red caída, timeouts, etc.
+        log.error(json.dumps({"evento": "error_conexion", "detalle": repr(e)[:300]}))
         yield _sse({"error": MENSAJE_ERROR})
 
 
@@ -194,7 +212,7 @@ async def chat(req: ChatRequest, request: Request):
     if not _check_rate(ip):
         raise HTTPException(429, "Enviaste muchos mensajes seguidos. Espera unos minutos.")
     mensajes = _preparar_historial(req.messages)
-    gen = _stream_mock(mensajes[-1]["content"]) if MOCK_MODE else _stream_claude(mensajes, ip)
+    gen = _stream_mock(mensajes[-1]["content"]) if MOCK_MODE else _stream_gemini(mensajes, ip)
     return StreamingResponse(
         gen,
         media_type="text/event-stream",
